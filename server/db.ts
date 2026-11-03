@@ -5,18 +5,7 @@ import * as schema from "@shared/schema";
 
 neonConfig.webSocketConstructor = ws;
 
-// Check for DATABASE_URL in different locations for Replit compatibility
-let databaseUrl = process.env.DATABASE_URL;
-
-// For Replit environment, try reading from file if environment variable is not set
-if (!databaseUrl) {
-  try {
-    const fs = require('fs');
-    databaseUrl = fs.readFileSync('/tmp/replitdb', 'utf8').trim();
-  } catch (error) {
-    // If file doesn't exist, keep trying other methods
-  }
-}
+const databaseUrl = process.env.DATABASE_URL;
 
 if (!databaseUrl) {
   throw new Error(

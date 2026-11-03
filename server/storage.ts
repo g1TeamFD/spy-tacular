@@ -13,12 +13,10 @@ import {
   achievementCard
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, desc, sql, and, gte } from "drizzle-orm";
+import { eq, desc, sql, and, gte, or, isNull, isNotNull, lt } from "drizzle-orm";
 import session from "express-session";
 import connectPg from "connect-pg-simple";
 import { pool } from "./db";
-import { promises as fs } from 'fs';
-import { join } from 'path';
 
 export interface IStorage {
   // User operations
@@ -43,9 +41,11 @@ export interface IStorage {
   hasRecentAchievementCard(email: string, hoursBack?: number): Promise<boolean>;
   
   // Data export operations
-  getAllGameSessionsWithAnswers(): Promise<any[]>;
   getLeaderboardData(limit?: number): Promise<any[]>;
-  updateStaticGameSessionsFile(): Promise<void>;
+
+  // Google Sheets sync
+  getSessionsPendingSheetsSync(idleMinutes: number, limit: number): Promise<GameSessionType[]>;
+  markSheetsSynced(id: string, syncedUpdatedAt: Date): Promise<void>;
   
   // Session store for authentication
   sessionStore: session.Store;
@@ -99,7 +99,7 @@ export class DatabaseStorage implements IStorage {
   async updateGameSession(id: string, updates: Partial<Omit<InsertGameSession, 'id' | 'createdAt'>>): Promise<GameSessionType | undefined> {
     const [updated] = await db
       .update(gameSession)
-      .set(updates)
+      .set({ ...updates, updatedAt: new Date() })
       .where(eq(gameSession.id, id))
       .returning();
     return updated || undefined;
@@ -139,6 +139,8 @@ export class DatabaseStorage implements IStorage {
       .insert(playerAnswer)
       .values(answer)
       .returning();
+    // Make the session re-sync so the new answer reaches the sheet
+    await db.update(gameSession).set({ updatedAt: new Date() }).where(eq(gameSession.id, answer.sessionId));
     return answerResult;
   }
 
@@ -171,77 +173,6 @@ export class DatabaseStorage implements IStorage {
       .limit(1);
     
     return !!recent;
-  }
-
-  // Data export operations
-  async getAllGameSessionsWithAnswers(): Promise<any[]> {
-    // Get all game sessions with their associated player answers
-    const sessions = await db
-      .select()
-      .from(gameSession)
-      .orderBy(desc(gameSession.createdAt));
-    
-    const results = [];
-    
-    for (const session of sessions) {
-      // Get answers for this session
-      const answers = await db
-        .select()
-        .from(playerAnswer)
-        .where(eq(playerAnswer.sessionId, session.id))
-        .orderBy(desc(playerAnswer.createdAt));
-      
-      // Calculate session duration if ended
-      const sessionDuration = session.endedAt && session.createdAt 
-        ? Math.floor((session.endedAt.getTime() - session.createdAt.getTime()) / 1000)
-        : session.sessionDuration;
-      
-      // Base session data
-      const sessionData = {
-        playId: session.id,
-        playerEmail: session.playerEmail || 'Anonymous',
-        score: session.score,
-        level: session.level,
-        linesCleared: session.linesCleared || 0,
-        piecesPlaced: session.piecesPlaced || 0,
-        sentencesAttempted: session.sentencesAttempted || 0,
-        sentencesCompleted: session.sentencesCompleted || 0,
-        sessionDuration: sessionDuration || 0,
-        deviceType: session.deviceType || 'Unknown',
-        browserInfo: session.browserInfo || 'Unknown',
-        country: session.country || 'Unknown',
-        region: session.region || 'Unknown',
-        personaCardsEarned: session.personaCardsEarned || 0,
-        sessionStartTime: session.createdAt,
-        sessionEndTime: session.endedAt
-      };
-      
-      // If no answers, add one row for the session
-      if (answers.length === 0) {
-        results.push({
-          ...sessionData,
-          sentenceId: '',
-          sentenceTemplate: '',
-          playerAnswer: '',
-          answerScore: 0,
-          answerTimestamp: null
-        });
-      } else {
-        // Add one row for each answer
-        for (const answer of answers) {
-          results.push({
-            ...sessionData,
-            sentenceId: answer.sentenceId,
-            sentenceTemplate: `Sentence ${answer.sentenceId}`, // You can enhance this with actual templates
-            playerAnswer: answer.answer,
-            answerScore: answer.score,
-            answerTimestamp: answer.createdAt
-          });
-        }
-      }
-    }
-    
-    return results;
   }
 
   // Leaderboard operations
@@ -311,28 +242,23 @@ export class DatabaseStorage implements IStorage {
     return leaderboardData;
   }
 
-  // Static file operations
-  async updateStaticGameSessionsFile(): Promise<void> {
-    try {
-      // Get all game sessions with answers
-      const data = await this.getAllGameSessionsWithAnswers();
-      
-      // Create the JSON structure
-      const jsonData = {
-        exportDate: new Date().toISOString(),
-        totalSessions: data.length,
-        data: data
-      };
-      
-      // Write to static file in repository root
-      const filePath = join(process.cwd(), 'game-sessions.json');
-      await fs.writeFile(filePath, JSON.stringify(jsonData, null, 2), 'utf8');
-      
-      console.log(`Updated game-sessions.json with ${data.length} sessions`);
-    } catch (error) {
-      console.error('Failed to update static game sessions file:', error);
-      // Don't throw error to avoid breaking game functionality
-    }
+  // Google Sheets sync operations
+  async getSessionsPendingSheetsSync(idleMinutes: number, limit: number): Promise<GameSessionType[]> {
+    const idleCutoff = new Date(Date.now() - idleMinutes * 60 * 1000);
+    return await db
+      .select()
+      .from(gameSession)
+      .where(and(
+        // Ended sessions, or sessions that never sent an end signal and have gone quiet
+        or(isNotNull(gameSession.endedAt), lt(gameSession.createdAt, idleCutoff)),
+        or(isNull(gameSession.sheetsSyncedAt), lt(gameSession.sheetsSyncedAt, gameSession.updatedAt))
+      ))
+      .orderBy(gameSession.updatedAt)
+      .limit(limit);
+  }
+
+  async markSheetsSynced(id: string, syncedUpdatedAt: Date): Promise<void> {
+    await db.update(gameSession).set({ sheetsSyncedAt: syncedUpdatedAt }).where(eq(gameSession.id, id));
   }
 }
 

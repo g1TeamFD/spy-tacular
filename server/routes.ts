@@ -1,14 +1,33 @@
-import type { Express } from "express";
+import type { Express, RequestHandler } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
 import { setupAuth } from "./auth";
 import { sendAchievementCard } from "./sendgrid";
+import geoip from "geoip-lite";
+import { z } from "zod";
 import { 
   insertGameSessionSchema,
   insertPlayerAnswerSchema,
   insertAchievementCardSchema,
-  calculatePersonaCards
+  calculatePersonaCards,
+  getDeviceType,
+  type InsertGameSession
 } from "@shared/schema";
+import { syncSession } from "./sheetsSync";
+
+const counter = (max: number) => z.number().int().min(0).max(max);
+
+// The only fields a browser may send about a play session. Everything else is set by the server.
+const sessionUpdateSchema = z.object({
+  score: counter(1_000_000),
+  level: z.number().int().min(1).max(1000),
+  linesCleared: counter(100_000),
+  piecesPlaced: counter(100_000),
+  sentencesAttempted: counter(100_000),
+  sentencesCompleted: counter(100_000),
+  endReason: z.enum(["game_over", "left"]),
+  playerEmail: z.string().trim().email().max(254),
+}).partial(); // unknown fields (e.g. endedAt from an older cached client) are dropped, never applied
 
 export async function registerRoutes(app: Express): Promise<Server> {
   // Setup authentication routes: /api/register, /api/login, /api/logout, /api/user
@@ -28,9 +47,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       
       const session = await storage.createGameSession(sessionData);
       
-      // Update static JSON file
-      storage.updateStaticGameSessionsFile().catch(console.error);
-      
       res.status(201).json(session);
     } catch (error) {
       res.status(400).json({ message: error instanceof Error ? error.message : 'Unknown error' });
@@ -40,62 +56,65 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Anonymous game session routes
   app.post("/api/anonymous-session", async (req, res) => {
     try {
-      const sessionData = insertGameSessionSchema.parse({
-        ...req.body,
-        playerEmail: req.body.playerEmail || null // Allow null for anonymous sessions
-      });
-      
+      const body = sessionUpdateSchema.pick({ playerEmail: true }).parse(req.body ?? {});
+      const userAgent = req.get("user-agent") ?? "";
+      const geo = req.ip ? geoip.lookup(req.ip) : null; // IP is used for lookup only, never stored
+
+      const sessionData: InsertGameSession = {
+        playerEmail: body.playerEmail ?? null,
+        deviceType: getDeviceType(userAgent),
+        browserInfo: userAgent,
+        country: geo?.country ?? "Unknown",
+        region: geo?.region || "Unknown",
+      };
+
       const session = await storage.createGameSession(sessionData);
-      
-      // Update static JSON file
-      storage.updateStaticGameSessionsFile().catch(console.error);
-      
       res.status(201).json(session);
     } catch (error) {
       res.status(400).json({ message: error instanceof Error ? error.message : 'Unknown error' });
     }
   });
 
-  app.patch("/api/anonymous-session/:id", async (req, res) => {
+  // Update a play session. POST /end exists because navigator.sendBeacon can only POST.
+  const updateAnonymousSession: RequestHandler = async (req, res) => {
     try {
       const sessionId = req.params.id;
-      
-      // Check session exists
-      const existingSession = await storage.getGameSession(sessionId);
-      if (!existingSession) {
+      const existing = await storage.getGameSession(sessionId);
+      if (!existing) {
         return res.status(404).json({ message: "Session not found" });
       }
-      
-      // Allow updates to anonymous sessions
-      const allowedFields = [
-        'score', 'level', 'completedSentences', 'sessionDuration', 
-        'linesCleared', 'piecesPlaced', 'sentencesAttempted', 'sentencesCompleted',
-        'deviceType', 'browserInfo', 'ipAddress', 'country', 'region', 
-        'personaCardsEarned', 'endedAt', 'playerEmail'
-      ] as const;
-      
-      const allowedUpdates: any = {};
-      for (const field of allowedFields) {
-        if (req.body[field] !== undefined) {
-          // Handle endedAt field conversion from string to Date
-          if (field === 'endedAt' && req.body[field]) {
-            allowedUpdates[field] = new Date(req.body[field]);
-          } else {
-            allowedUpdates[field] = req.body[field];
-          }
+
+      const parsed = sessionUpdateSchema.parse(req.body ?? {});
+      let updates: Partial<InsertGameSession> = {};
+
+      if (existing.endedAt) {
+        // First end wins. After the game is over, the only allowed change is attaching an email.
+        if (parsed.playerEmail) updates.playerEmail = parsed.playerEmail;
+      } else {
+        updates = { ...parsed };
+        if (parsed.score !== undefined) {
+          updates.personaCardsEarned = calculatePersonaCards(parsed.score);
+        }
+        if (parsed.endReason) {
+          const now = new Date();
+          updates.endedAt = now;
+          updates.sessionDuration = Math.floor((now.getTime() - existing.createdAt.getTime()) / 1000);
         }
       }
-      
-      const session = await storage.updateGameSession(sessionId, allowedUpdates);
-      
-      // Update static JSON file
-      storage.updateStaticGameSessionsFile().catch(console.error);
-      
+
+      if (Object.keys(updates).length === 0) {
+        return res.json(existing);
+      }
+
+      const session = await storage.updateGameSession(sessionId, updates);
+      if (session?.endedAt) syncSession(sessionId);
       res.json(session);
     } catch (error) {
       res.status(400).json({ message: error instanceof Error ? error.message : 'Unknown error' });
     }
-  });
+  };
+  app.patch("/api/anonymous-session/:id", updateAnonymousSession);
+  app.post("/api/anonymous-session/:id/end", updateAnonymousSession);
 
   app.patch("/api/game-session/:id", async (req, res) => {
     try {
@@ -124,9 +143,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       
       const session = await storage.updateGameSession(sessionId, allowedUpdates);
-      
-      // Update static JSON file
-      storage.updateStaticGameSessionsFile().catch(console.error);
       
       res.json(session);
     } catch (error) {
@@ -297,27 +313,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // JSON Export route - accessible without authentication for admin purposes
-  app.get("/api/export/game-sessions.json", async (req, res) => {
-    try {
-      // Get all game sessions with answers
-      const data = await storage.getAllGameSessionsWithAnswers();
-      
-      // Set JSON response headers
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', `attachment; filename="ecoBlocks-game-sessions-${new Date().toISOString().split('T')[0]}.json"`);
-      
-      res.json({
-        exportDate: new Date().toISOString(),
-        totalSessions: data.length,
-        data: data
-      });
-    } catch (error) {
-      console.error('JSON Export Error:', error);
-      res.status(500).json({ message: error instanceof Error ? error.message : 'Export failed' });
-    }
-  });
-
   // Leaderboard route - public endpoint for game feature
   app.get("/api/leaderboard", async (req, res) => {
     try {
@@ -331,76 +326,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error) {
       console.error('Leaderboard Error:', error);
       res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to load leaderboard' });
-    }
-  });
-
-  // CSV Export route - accessible without authentication for admin purposes
-  app.get("/api/export/player-data.csv", async (req, res) => {
-    try {
-      // Get all game sessions with answers
-      const data = await storage.getAllGameSessionsWithAnswers();
-      
-      // CSV headers
-      const csvHeaders = [
-        'Play ID',
-        'Player Email', 
-        'Session Start Time',
-        'Session End Time',
-        'Session Duration (seconds)',
-        'Final Score',
-        'Level Reached',
-        'Lines Cleared',
-        'Pieces Placed',
-        'Sentences Attempted',
-        'Sentences Completed',
-        'Persona Cards Earned',
-        'Device Type',
-        'Browser Info',
-        'Country',
-        'Region',
-        'Sentence ID',
-        'Sentence Template',
-        'Player Answer',
-        'Answer Score',
-        'Answer Timestamp'
-      ].join(',');
-      
-      // Convert data to CSV rows
-      const csvRows = data.map(row => [
-        row.playId,
-        row.playerEmail,
-        row.sessionStartTime ? row.sessionStartTime.toISOString() : '',
-        row.sessionEndTime ? row.sessionEndTime.toISOString() : '',
-        row.sessionDuration,
-        row.score,
-        row.level,
-        row.linesCleared,
-        row.piecesPlaced,
-        row.sentencesAttempted,
-        row.sentencesCompleted,
-        calculatePersonaCards(row.score),
-        row.deviceType,
-        `"${row.browserInfo.replace(/"/g, '""')}"`, // Escape quotes in browser info
-        row.country,
-        row.region,
-        row.sentenceId,
-        `"${row.sentenceTemplate.replace(/"/g, '""')}"`, // Escape quotes
-        `"${row.playerAnswer.replace(/"/g, '""')}"`, // Escape quotes
-        row.answerScore,
-        row.answerTimestamp ? row.answerTimestamp.toISOString() : ''
-      ].join(','));
-      
-      // Combine headers and rows
-      const csvContent = [csvHeaders, ...csvRows].join('\n');
-      
-      // Set CSV response headers
-      res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="ecoBlocks-player-data-${new Date().toISOString().split('T')[0]}.csv"`);
-      
-      res.send(csvContent);
-    } catch (error) {
-      console.error('CSV Export Error:', error);
-      res.status(500).json({ message: error instanceof Error ? error.message : 'Export failed' });
     }
   });
 
