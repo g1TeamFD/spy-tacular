@@ -45,6 +45,10 @@ export const gameSession = pgTable("game_session", {
   personaCardsEarned: integer("persona_cards_earned").notNull().default(0),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   endedAt: timestamp("ended_at"),
+  endReason: text("end_reason"), // game_over | left (tab closed); null = no end signal received
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
+  // Value of updated_at that was last written to Google Sheets. Pending sync = null or < updated_at.
+  sheetsSyncedAt: timestamp("sheets_synced_at"),
 });
 
 export const playerAnswer = pgTable("player_answer", {
@@ -95,13 +99,6 @@ export type GameState = {
   paused: boolean;
 };
 
-export type SentenceChallenge = {
-  id: string;
-  template: string; // e.g., "We must _____ our planet for future generations."
-  answer: string;
-  keywords: string[];
-};
-
 export const insertUserSchema = createInsertSchema(users).pick({
   username: true,
   email: true,
@@ -117,6 +114,8 @@ export const insertPlayerProfileSchema = createInsertSchema(playerProfile).omit(
 export const insertGameSessionSchema = createInsertSchema(gameSession).omit({
   id: true,
   createdAt: true,
+  updatedAt: true,
+  sheetsSyncedAt: true,
 }).extend({
   completedSentences: z.array(z.string()).optional(),
 });

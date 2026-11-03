@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { SENTENCE_CHALLENGES } from '@shared/sentences';
 import GameBoard from '@/components/GameBoard';
 import GameControls from '@/components/GameControls';
 import ScoreDisplay from '@/components/ScoreDisplay';
@@ -8,7 +9,6 @@ import LeaderboardModal from '@/components/LeaderboardModal';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Play, Info } from 'lucide-react';
-import { getDeviceType, calculatePersonaCards } from '@shared/schema';
 
 // Mock data for the prototype
 const BLOCK_COLORS = [
@@ -35,27 +35,6 @@ const SUSTAINABILITY_KEYWORDS = [
   'respect', 'unity', 'together', 'harmony', 'balance', 'river', 'ocean', 'forest', 'clean',
   'renewable', 'recycle', 'reduce', 'reuse', 'diverse', 'inclusive', 'community', 'global',
   'citizen', 'responsibility', 'preserve', 'wildlife', 'ecosystem', 'solar', 'wind', 'organic'
-];
-
-const SENTENCE_CHALLENGES = [
-  {
-    id: '1',
-    template: 'We must _____ our planet for future generations.',
-    answer: 'protect',
-    keywords: ['protect', 'preserve', 'care', 'sustain']
-  },
-  {
-    id: '2', 
-    template: 'Together we can create a more _____ world.',
-    answer: 'sustainable',
-    keywords: ['sustainable', 'green', 'balanced', 'harmonious']
-  },
-  {
-    id: '3',
-    template: 'Every person deserves _____ and dignity.',
-    answer: 'respect',
-    keywords: ['respect', 'love', 'care', 'equality']
-  }
 ];
 
 type GamePiece = {
@@ -116,20 +95,14 @@ export default function GamePage() {
   // Session management functions
   const createSession = useCallback(async () => {
     try {
-      const deviceType = getDeviceType(navigator.userAgent);
       const response = await fetch('/api/anonymous-session', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
+        // Device, browser and location are derived server-side
         body: JSON.stringify({
-          score: 0,
-          level: 1,
-          completedSentences: [],
-          deviceType,
-          browserInfo: navigator.userAgent,
           ...(storedEmail && { playerEmail: storedEmail }), // Use stored email if available
-          // Note: Geographic data will be added separately
         }),
       });
       
@@ -153,6 +126,7 @@ export default function GamePage() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(updates),
+        keepalive: true, // let the final update finish even if the tab is closing
       });
       
       if (response.ok) {
@@ -169,9 +143,7 @@ export default function GamePage() {
   const endSession = useCallback(async (sessionId: string, finalScore: number, playerEmail?: string) => {
     if (!sessionStartTime) return;
     
-    const sessionDuration = Math.floor((Date.now() - sessionStartTime.getTime()) / 1000);
-    const personaCardsEarned = calculatePersonaCards(finalScore);
-    
+    // Duration, end time and persona cards are computed server-side
     const updates = {
       score: finalScore,
       level,
@@ -179,14 +151,34 @@ export default function GamePage() {
       piecesPlaced,
       sentencesAttempted,
       sentencesCompleted,
-      sessionDuration,
-      personaCardsEarned,
-      endedAt: new Date(),
+      endReason: 'game_over',
       ...(playerEmail && { playerEmail })
     };
     
     await updateSession(sessionId, updates);
   }, [sessionStartTime, level, lines, piecesPlaced, sentencesAttempted, sentencesCompleted, updateSession]);
+
+  // If the player leaves mid-game, record the session with its current stats
+  const liveSession = useRef({ sessionId: null as string | null, gameStarted: false, gameOver: false, stats: {} as Record<string, number> });
+  liveSession.current = {
+    sessionId: currentSessionId,
+    gameStarted,
+    gameOver,
+    stats: { score, level, linesCleared: lines, piecesPlaced, sentencesAttempted, sentencesCompleted },
+  };
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      const { sessionId, gameStarted, gameOver, stats } = liveSession.current;
+      if (!sessionId || !gameStarted || gameOver) return;
+      navigator.sendBeacon(
+        `/api/anonymous-session/${sessionId}/end`,
+        new Blob([JSON.stringify({ ...stats, endReason: 'left' })], { type: 'application/json' })
+      );
+    };
+    window.addEventListener('pagehide', handlePageHide);
+    return () => window.removeEventListener('pagehide', handlePageHide);
+  }, []);
 
   // Collision detection
   const isValidPosition = useCallback((piece: GamePiece, board: ({ keyword: string; color: string } | null)[][]) => {
